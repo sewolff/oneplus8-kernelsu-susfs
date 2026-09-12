@@ -276,6 +276,10 @@ jobs:
           scripts/config --file out/.config -e KPM
           # Disable BPF preload UMD - not needed on Android, fails to build in CI (missing incbin)
           scripts/config --file out/.config -d BPF_PRELOAD
+          # Disable legacy mainline DRM/MSM driver - not used (real display driver is techpack/display/msm),
+          # pulled in as a dependency-resolution side effect on the crDroid tree and contains a pre-existing
+          # broken strnstr() call that fails to compile
+          scripts/config --file out/.config -d DRM_MSM
           make O=out ARCH=arm64 olddefconfig
           echo "Checking KSU, SUSFS, and KPM config:"
           grep -E "CONFIG_KSU|CONFIG_THREAD_INFO|CONFIG_KPM" out/.config | head -40
