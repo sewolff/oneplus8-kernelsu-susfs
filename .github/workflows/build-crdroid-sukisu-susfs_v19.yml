@@ -1,0 +1,672 @@
+name: Build crDroid Kernel with SukiSU-Ultra + SUSFS (Kebab, Non-GKI)
+
+on:
+  workflow_dispatch:
+
+env:
+  KERNEL_SOURCE: https://github.com/crdroidandroid/android_kernel_oneplus_sm8250.git
+  KERNEL_BRANCH: "16.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl wget bc bison build-essential flex \
+            libssl-dev libelf-dev python3 cpio zip android-sdk-libsparse-utils lz4
+
+      - name: Setup mkbootimg tools
+        run: |
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg
+          chmod +x mkbootimg/*.py
+          echo "$GITHUB_WORKSPACE/mkbootimg" >> $GITHUB_PATH
+
+      - name: Setup Clang
+        run: |
+          mkdir -p toolchains/clang
+          curl -sL "https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20250704-release/Clang-14.0.6-20250704.tar.gz" | \
+            tar -xzf - -C toolchains/clang
+          echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
+
+      - name: Setup GCC
+        run: |
+          git clone --depth=1 -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            toolchains/gcc64
+          git clone --depth=1 -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+            toolchains/gcc32
+          echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> $GITHUB_PATH
+
+      - name: Clone Kernel
+        run: |
+          git clone --depth=1 -b $KERNEL_BRANCH $KERNEL_SOURCE kernel
+
+      - name: Fix LineageOS 23 Bugs
+        run: |
+          cd kernel
+          sed -i 's/if (pon->log_kpd_event && (cfg->pon_type == PON_KPDPWR))/if (0)/' drivers/input/misc/qpnp-power-on.c
+          sed -i 's/if (pon->log_kpd_event) {/if (0) {/' drivers/input/misc/qpnp-power-on.c
+          sed -i '/pon->log_kpd_event = of_property_read_bool/,/"qcom,log-kpd-event");/d' drivers/input/misc/qpnp-power-on.c
+          sed -i '1i struct smb_charger;' drivers/power/supply/qcom/schgm-flash.h || true
+          sed -i '/#include "schgm-flash.h"/a #include "smb5-lib.h"' drivers/power/supply/qcom/schgm-flash.c || true
+          sed -i 's/global_zone_page_state(NR_IONCACHE_PAGES)/0/g' drivers/staging/android/ion/ion_system_heap.c || true
+
+      - name: Apply SUSFS v2.0.0 patches
+        run: |
+          cd kernel
+          echo "Applying SUSFS v2.0.0 patches from ApartTUSITU/kernel_xiaomi_sm8250_mod..."
+
+          # Apply SUSFS source files patch (adds susfs.c, susfs.h, susfs_def.h)
+          echo "=== Applying SUSFS source files patch ==="
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs-patches/00_add_susfs_source.patch || {
+            echo "Some hunks failed, continuing..."
+            find . -name "*.rej" -exec cat {} \; 2>/dev/null || true
+          }
+
+          # Apply SUSFS kernel hooks patch (modifies namei.c, namespace.c, etc.)
+          echo "=== Applying SUSFS hooks patch ==="
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs-patches/01_add_susfs_hooks.patch || {
+            echo "Some hooks failed, will try manual fixes..."
+          }
+
+          # Apply misc SUSFS patches
+          echo "=== Applying misc SUSFS patches ==="
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs-patches/02_add_susfs_misc.patch || {
+            echo "Some misc patches failed..."
+          }
+
+          # Apply LineageOS-specific fix patches for failed hunks
+          echo "=== Applying LineageOS fix patches ==="
+          echo "Fixing fs/exec.c include..."
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs-patches/03_fix_exec.patch || true
+          echo "Fixing fs/namespace.c clone_mnt..."
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs-patches/04_fix_namespace_clone_mnt.patch || true
+          echo "Fixing fs/proc/task_mmu.c pagemap_read..."
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs-patches/05_fix_task_mmu.patch || true
+
+          # Cleanup reject files
+          find . -name "*.rej" -delete 2>/dev/null || true
+          find . -name "*.orig" -delete 2>/dev/null || true
+
+          # Update fs/Makefile for SUSFS
+          if ! grep -q "susfs.o" fs/Makefile; then
+            echo "Adding susfs.o to fs/Makefile..."
+            sed -i '/^obj-y.*:=/a obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+          fi
+
+          echo "=== Verifying SUSFS files ==="
+          ls -la fs/susfs.c include/linux/susfs*.h 2>/dev/null || echo "SUSFS files not found - check patches"
+          grep "susfs" fs/Makefile
+          echo "SUSFS version:"
+          grep "SUSFS_VERSION" include/linux/susfs.h 2>/dev/null || echo "Version not found"
+
+      - name: Backport path_umount and get_cred_rcu
+        run: |
+          cd kernel
+          echo "Adding kernel backports for 4.19..."
+
+          if ! grep -q "^static int can_umount" fs/namespace.c; then
+            echo "" >> fs/namespace.c
+            echo "/* Backport can_umount for SUSFS/KernelSU */" >> fs/namespace.c
+            echo "static int can_umount(const struct path *path, int flags)" >> fs/namespace.c
+            echo "{" >> fs/namespace.c
+            echo "    struct mount *mnt = real_mount(path->mnt);" >> fs/namespace.c
+            echo "    if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))" >> fs/namespace.c
+            echo "        return -EINVAL;" >> fs/namespace.c
+            echo "    if (!may_mount())" >> fs/namespace.c
+            echo "        return -EPERM;" >> fs/namespace.c
+            echo "    if (path->dentry != path->mnt->mnt_root)" >> fs/namespace.c
+            echo "        return -EINVAL;" >> fs/namespace.c
+            echo "    if (!check_mnt(mnt))" >> fs/namespace.c
+            echo "        return -EINVAL;" >> fs/namespace.c
+            echo "    if (mnt->mnt.mnt_flags & MNT_LOCKED)" >> fs/namespace.c
+            echo "        return -EINVAL;" >> fs/namespace.c
+            echo "    if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))" >> fs/namespace.c
+            echo "        return -EPERM;" >> fs/namespace.c
+            echo "    return 0;" >> fs/namespace.c
+            echo "}" >> fs/namespace.c
+          fi
+
+          if ! grep -q "^int path_umount" fs/namespace.c; then
+            echo "" >> fs/namespace.c
+            echo "/* Backport path_umount from Linux 5.9+ for KernelSU/SUSFS */" >> fs/namespace.c
+            echo "int path_umount(struct path *path, int flags)" >> fs/namespace.c
+            echo "{" >> fs/namespace.c
+            echo "    struct mount *mnt = real_mount(path->mnt);" >> fs/namespace.c
+            echo "    int ret;" >> fs/namespace.c
+            echo "    ret = can_umount(path, flags);" >> fs/namespace.c
+            echo "    if (!ret)" >> fs/namespace.c
+            echo "        ret = do_umount(mnt, flags);" >> fs/namespace.c
+            echo "    dput(path->dentry);" >> fs/namespace.c
+            echo "    mntput_no_expire(mnt);" >> fs/namespace.c
+            echo "    return ret;" >> fs/namespace.c
+            echo "}" >> fs/namespace.c
+            echo "EXPORT_SYMBOL(path_umount);" >> fs/namespace.c
+          fi
+
+          if ! grep -q "int path_umount" fs/internal.h; then
+            sed -i '/^extern void __init mnt_init/a int path_umount(struct path *path, int flags);' fs/internal.h
+          fi
+
+          if ! grep -q "get_cred_rcu" include/linux/cred.h; then
+            echo "Adding get_cred_rcu backport..."
+            echo "" > /tmp/get_cred_rcu.txt
+            echo "/* Backport get_cred_rcu for KernelSU */" >> /tmp/get_cred_rcu.txt
+            echo "static inline const struct cred *get_cred_rcu(const struct cred *cred)" >> /tmp/get_cred_rcu.txt
+            echo "{" >> /tmp/get_cred_rcu.txt
+            echo "    struct cred *nonconst_cred = (struct cred *) cred;" >> /tmp/get_cred_rcu.txt
+            echo "    if (!cred)" >> /tmp/get_cred_rcu.txt
+            echo "        return NULL;" >> /tmp/get_cred_rcu.txt
+            echo "    if (!atomic_inc_not_zero(&nonconst_cred->usage))" >> /tmp/get_cred_rcu.txt
+            echo "        return NULL;" >> /tmp/get_cred_rcu.txt
+            echo "    return cred;" >> /tmp/get_cred_rcu.txt
+            echo "}" >> /tmp/get_cred_rcu.txt
+            echo "" >> /tmp/get_cred_rcu.txt
+            LINE=$(grep -n "^static inline void put_cred" include/linux/cred.h | head -1 | cut -d: -f1)
+            if [ -n "$LINE" ]; then
+              head -n $((LINE - 1)) include/linux/cred.h > /tmp/cred_new.h
+              cat /tmp/get_cred_rcu.txt >> /tmp/cred_new.h
+              tail -n +$LINE include/linux/cred.h >> /tmp/cred_new.h
+              mv /tmp/cred_new.h include/linux/cred.h
+            fi
+          fi
+
+          echo 'CFLAGS_namespace.o += -Wno-unused-function' >> fs/Makefile
+
+      - name: Setup SukiSU-Ultra (ApartTUSITU fork)
+        run: |
+          cd kernel
+          echo "Setting up SukiSU-Ultra (ApartTUSITU fork for SUSFS v2.0.0 compatibility)..."
+
+          # Use the ApartTUSITU fork's setup script like k30s-reference does
+          curl -LSs "https://raw.githubusercontent.com/ApartTUSITU/SukiSU-Ultra/main/kernel/setup.sh" | bash -s ApartTUSITU
+
+          if [ ! -d "KernelSU" ]; then
+            echo "ERROR: SukiSU-Ultra setup failed!"
+            exit 1
+          fi
+
+          # Pin to a verified-working commit instead of a moving "main" target - setup.sh does
+          # a fresh `git pull` on every run, so the driver's API can silently shift between
+          # builds (this is exactly how we ended up chasing renamed/removed hook functions).
+          cd KernelSU
+          git checkout d18fd3079db3a5fbf86be2fc11997d46d0f03e66
+          cd ..
+
+          # This kernel (4.19) predates two newer APIs the driver assumes are available:
+          # 1) MODULE_IMPORT_NS: only introduced around Linux 5.x - the driver already guards
+          #    the string-argument form (>=6.13) but wrongly assumes the older bare-token form
+          #    exists on ANY kernel below that, when it simply doesn't exist at all pre-5.x.
+          perl -0777 -i -pe 's/(#else\nMODULE_IMPORT_NS\(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver\);\n#endif)/#elif defined(MODULE_IMPORT_NS)\nMODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);\n#endif/' KernelSU/kernel/ksu.c
+          # 2) access_ok(): this kernel still has the pre-5.0 3-arg macro access_ok(type, addr,
+          #    size) -> __range_ok(addr, size), but kpm.c calls the newer 2-arg form throughout.
+          #    Shim it locally for this file only.
+          perl -0777 -i -pe 's/(#include <linux\/version.h>\n)/$1\n\/* Pre-5.0 kernel: access_ok() is still the 3-arg macro; kpm.c uses the newer\n * 2-arg form throughout, so shim it locally for this file. *\/\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)\n#undef access_ok\n#define access_ok(addr, size) __range_ok(addr, size)\n#endif\n/' KernelSU/kernel/kpm/kpm.c
+          grep -q "elif defined(MODULE_IMPORT_NS)" KernelSU/kernel/ksu.c && echo "ksu.c patched" || echo "WARNING: ksu.c patch failed"
+          grep -q "define access_ok(addr, size) __range_ok(addr, size)" KernelSU/kernel/kpm/kpm.c && echo "kpm.c patched" || echo "WARNING: kpm.c patch failed"
+
+          # 3) allowlist.c: put_task_struct() is declared in linux/sched/task.h, which nothing
+          #    else in this file pulls in transitively on this kernel.
+          perl -0777 -i -pe 's/(#include <linux\/task_work.h>\n)/$1#include <linux\/sched\/task.h>\n/' KernelSU/kernel/allowlist.c
+          grep -q "include <linux/sched/task.h>" KernelSU/kernel/allowlist.c && echo "allowlist.c patched (put_task_struct)" || echo "WARNING: allowlist.c sched/task.h patch failed"
+
+          # 4) app_profile.c: struct seccomp on this kernel only has {mode, filter} - no
+          #    atomic_t filter_count (added around 5.9). mode=0/DISABLED + filter=NULL already
+          #    fully clears seccomp state here, so the filter_count reset is simply inapplicable.
+          perl -0777 -i -pe 's/(    atomic_set\(&current->seccomp\.filter_count, 0\);\n)/#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n$1#endif\n/' KernelSU/kernel/app_profile.c
+          perl -0777 -i -pe 's/(    atomic_set\(&tsk->seccomp\.filter_count, 0\);\n)/#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n$1#endif\n/' KernelSU/kernel/app_profile.c
+          grep -q "KERNEL_VERSION(5, 9, 0)" KernelSU/kernel/app_profile.c && echo "app_profile.c patched" || echo "WARNING: app_profile.c patch failed"
+
+          # 5) pkg_observer.c: struct fsnotify_ops only has the generic handle_event() callback
+          #    here - handle_inode_event() (a simpler per-inode variant) was split out later
+          #    (~5.9). Add a compat adapter with the equivalent logic for older kernels.
+          python3 << 'PYEOF'
+          with open('KernelSU/kernel/pkg_observer.c') as f:
+              content = f.read()
+
+          old_block = '''static const struct fsnotify_ops ksu_ops = {
+              .handle_inode_event = ksu_handle_inode_event,
+          };'''
+
+          new_block = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+          /* Older kernels only have the generic handle_event() callback, not the
+           * simpler per-inode handle_inode_event() split introduced later. Adapt. */
+          static int ksu_handle_event_compat(struct fsnotify_group *group,
+                                             struct inode *inode,
+                                             u32 mask, const void *data, int data_type,
+                                             const unsigned char *file_name, u32 cookie,
+                                             struct fsnotify_iter_info *iter_info)
+          {
+              if (!file_name)
+                  return 0;
+              if (mask & FS_ISDIR)
+                  return 0;
+              if (!strcmp(file_name, "packages.list")) {
+                  pr_info("packages.list detected: %d\\n", mask);
+                  track_throne(false);
+              }
+              return 0;
+          }
+
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_event = ksu_handle_event_compat,
+          };
+          #else
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_inode_event = ksu_handle_inode_event,
+          };
+          #endif'''
+
+          assert content.count(old_block) == 1, f"pkg_observer.c anchor not found (count={content.count(old_block)})"
+          content = content.replace(old_block, new_block)
+          content = content.replace(
+              '#include <linux/version.h>',
+              '#include <linux/version.h>\n#include <linux/string.h>',
+              1
+          )
+
+          with open('KernelSU/kernel/pkg_observer.c', 'w') as f:
+              f.write(content)
+          print("pkg_observer.c patched")
+          print("pkg_observer.c patched")
+          PYEOF
+
+          # 6) setuid_hook.c: calls to ksu_seccomp_allow_cache() - a seccomp "action cache"
+          #    feature Android backported in 5.10.2; the whole struct/function is compiled out
+          #    entirely below that version (see seccomp_cache.h's own guard), so these calls
+          #    need the same guard here.
+          perl -0777 -i -pe 's/(        ksu_seccomp_allow_cache\(current->seccomp\.filter, __NR_reboot\);\n)/#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 2)\n$1#endif\n/g' KernelSU/kernel/setuid_hook.c
+          perl -0777 -i -pe 's/(            ksu_seccomp_allow_cache\(current->seccomp\.filter, __NR_reboot\);\n)/#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 2)\n$1#endif\n/g' KernelSU/kernel/setuid_hook.c
+          [ "$(grep -c 'KERNEL_VERSION(5, 10, 2)' KernelSU/kernel/setuid_hook.c)" = "2" ] && echo "setuid_hook.c patched (seccomp cache guards)" || echo "WARNING: setuid_hook.c seccomp cache guard failed"
+
+          # 7) TWA_RESUME (task_work_add() notify-mode enum, introduced 5.9 - this kernel's
+          #    task_work_add() still takes a plain bool, no such enum exists) shows up across
+          #    several files in the driver, not just one - patch all of them in one pass instead
+          #    of chasing each build error individually.
+          for f in KernelSU/kernel/allowlist.c KernelSU/kernel/setuid_hook.c KernelSU/kernel/supercalls.c KernelSU/kernel/ksud.c KernelSU/kernel/kernel_umount.c; do
+            if grep -q "define TWA_RESUME true" "$f"; then
+              continue
+            fi
+            if grep -q "#include <linux/version.h>" "$f"; then
+              perl -0777 -i -pe 's/(#include <linux\/version.h>\n)/$1#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n#define TWA_RESUME true\n#endif\n/' "$f"
+            else
+              perl -0777 -i -pe 's/\A/#include <linux\/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n#define TWA_RESUME true\n#endif\n/' "$f"
+            fi
+            grep -q "define TWA_RESUME true" "$f" && echo "$f patched (TWA_RESUME)" || echo "WARNING: $f TWA_RESUME patch failed"
+          done
+
+          # 8) file_wrapper.c: iopoll (io_uring poll, added 5.9) and remap_file_range /
+          #    REMAP_FILE_DEDUP (added alongside it, replacing the older copy_file_range /
+          #    dedupe_file_range split this kernel still uses) don't exist in struct
+          #    file_operations here at all. Guard out the wrapper functions and their
+          #    assignments; the struct is kcalloc'd so omitting them just leaves NULL.
+          python3 << 'PYEOF'
+          with open('KernelSU/kernel/file_wrapper.c') as f:
+              content = f.read()
+
+          old1 = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+          static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb,
+                                        unsigned int v)
+          {
+              struct ksu_file_wrapper *data = kiocb->ki_filp->private_data;
+              struct file *orig = data->orig;
+              kiocb->ki_filp = orig;
+              return orig->f_op->iopoll(kiocb, icb, v);
+          }
+          #else
+          static int ksu_wrapper_iopoll(struct kiocb *kiocb, bool spin)
+          {
+              struct ksu_file_wrapper *data = kiocb->ki_filp->private_data;
+              struct file *orig = data->orig;
+              kiocb->ki_filp = orig;
+              return orig->f_op->iopoll(kiocb, spin);
+          }
+          #endif'''
+          assert content.count(old1) == 1, f"file_wrapper.c old1 anchor not found (count={content.count(old1)})"
+          new1 = "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n" + old1 + "\n#endif"
+          content = content.replace(old1, new1)
+
+          old2 = "    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n"
+          assert content.count(old2) == 1, f"file_wrapper.c old2 anchor not found (count={content.count(old2)})"
+          new2 = "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n" + old2 + "#endif\n"
+          content = content.replace(old2, new2)
+
+          old3 = '''static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in,
+                                                     struct file *file_out,
+                                                     loff_t pos_out, loff_t len,
+                                                     unsigned int remap_flags)
+          {
+              if (remap_flags & REMAP_FILE_DEDUP) {
+                  struct ksu_file_wrapper *data = file_out->private_data;
+                  struct file *orig = data->orig;
+                  return orig->f_op->remap_file_range(file_in, pos_in, orig, pos_out, len,
+                                                      remap_flags);
+              } else {
+                  struct ksu_file_wrapper *data = file_in->private_data;
+                  struct file *orig = data->orig;
+                  return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out,
+                                                      len, remap_flags);
+              }
+          }'''
+          assert content.count(old3) == 1, f"file_wrapper.c old3 anchor not found (count={content.count(old3)})"
+          new3 = "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n" + old3 + "\n#endif"
+          content = content.replace(old3, new3)
+
+          old4 = '''    p->ops.remap_file_range =
+                  fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;
+          '''
+          assert content.count(old4) == 1, f"file_wrapper.c old4 anchor not found (count={content.count(old4)})"
+          new4 = "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n" + old4 + "#endif\n"
+          content = content.replace(old4, new4)
+
+          with open('KernelSU/kernel/file_wrapper.c', 'w') as f:
+              f.write(content)
+          print("file_wrapper.c patched")
+          PYEOF
+
+          # Setup symlink
+          mkdir -p drivers
+          ln -sf "$(realpath KernelSU/kernel)" drivers/kernelsu
+
+          # crDroid tree: mm_struct already uses the renamed mmap_lock field (backported),
+          # but manual_su.h's compat shim assumes any kernel <5.7 still has mmap_sem and
+          # remaps mmap_lock -> mmap_sem, which no longer exists here. Strip the shim.
+          sed -i '/#define mmap_lock mmap_sem/d' drivers/kernelsu/manual_su.h
+
+          # manual_su.c: get_random_bytes() needs linux/random.h, not pulled in transitively here
+          perl -0777 -i -pe 's/(#include <linux\/string.h>\n)/$1#include <linux\/random.h>\n/' drivers/kernelsu/manual_su.c
+          grep -q "include <linux/random.h>" drivers/kernelsu/manual_su.c && echo "manual_su.c patched (get_random_bytes)" || echo "WARNING: manual_su.c random.h patch failed"
+
+          # Add to Makefile
+          if ! grep -q "kernelsu" drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          fi
+
+          # Add to Kconfig
+          if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+
+          ls -la drivers/kernelsu/
+          echo "SukiSU-Ultra version:"
+          cat drivers/kernelsu/Makefile | head -20
+          echo "Checking for SUSFS in supercalls.c:"
+          grep -c "SUSFS" drivers/kernelsu/supercalls.c || echo "Checking setuid_hook.c"
+          grep -c "SUSFS" drivers/kernelsu/setuid_hook.c || echo "SUSFS not found in setuid_hook.c either"
+
+      # NOTE: NOT applying 10_enable_susfs_for_ksu.patch - SukiSU builtin already has SUSFS in supercalls.c
+      # The kernel SUSFS files (susfs.c, susfs.h) are needed but driver patch would conflict
+
+      - name: Disable kprobes and enable manual hooks
+        run: |
+          cd kernel/drivers/kernelsu
+          echo "Disabling kprobes to force manual hooks..."
+          for f in *.c *.h; do
+            if [ -f "$f" ]; then
+              sed -i 's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' "$f"
+              sed -i 's/#if defined(CONFIG_KPROBES)/#if defined(CONFIG_KPROBES) \&\& 0/g' "$f"
+            fi
+          done
+          echo "ccflags-y += -DKSU_UMOUNT" >> Makefile
+          echo "Checking kprobes disabled..."
+          grep -n "CONFIG_KPROBES" *.c *.h | head -10
+
+      - name: Add Manual KSU Hooks for Non-GKI
+        run: |
+          cd kernel
+          echo "Adding manual KernelSU hooks for non-GKI kernel..."
+          if [ -f "$GITHUB_WORKSPACE/scripts/add-ksu-hooks.sh" ]; then
+            bash $GITHUB_WORKSPACE/scripts/add-ksu-hooks.sh
+          else
+            echo "Hook script not found, trying patch..."
+            curl -LSs "https://raw.githubusercontent.com/rksuorg/kernel_patches/master/manual_hook/kernel-4.19_5.4.patch" -o /tmp/manual_hook.patch
+            patch -p1 --no-backup-if-mismatch -F3 < /tmp/manual_hook.patch || echo "Patch applied with some failures"
+          fi
+
+          # The upstream hook script's own insertion pattern ("filename = getname_flags(")
+          # never matches inside do_execveat_common on EITHER kernel tree (LineageOS or
+          # crDroid) - that call actually lives in SYSCALL_DEFINE3(execve)/SYSCALL_DEFINE5(execveat),
+          # not inside do_execveat_common. It silently never fires on any tree; it was never a
+          # crDroid-specific issue. Separately: the ApartTUSITU/SukiSU-Ultra `main` branch (the
+          # actual branch used here, since "setup.sh ... ApartTUSITU" is not a valid ref and
+          # silently falls back to main) does NOT define ksu_handle_execveat/_sucompat or
+          # ksu_execveat_hook at all - only ksu_handle_execveat_ksud (fits do_execveat_common's
+          # own params) and ksu_handle_execve_sucompat (needs the raw userspace filename pointer,
+          # only available at the syscall entry, before getname()/getname_flags() convert it).
+          if ! grep -q "ksu_handle_execveat_ksud(" fs/exec.c; then
+            echo "execveat_ksud hook missing - inserting at do_execveat_common entry..."
+            perl -0777 -i -pe 's/(do_execveat_common\([^)]*\)\s*\{\n)/$1#ifdef CONFIG_KSU\n\tksu_handle_execveat_ksud(&fd, &filename, &argv, &envp, &flags);\n#endif\n/s' fs/exec.c
+            grep -q "ksu_handle_execveat_ksud(" fs/exec.c && echo "Hook inserted successfully" || echo "WARNING: hook insertion still failed, needs manual review"
+          fi
+          if ! grep -q "ksu_handle_execve_sucompat(" fs/exec.c; then
+            echo "execve_sucompat hook missing - inserting at execve/execveat syscall entry..."
+            perl -0777 -i -pe 's/(\nSYSCALL_DEFINE3\(execve,\n)/\n#ifdef CONFIG_KSU\nextern int ksu_handle_execve_sucompat(const char __user **filename_user,\n\t\t\t\t       void *__never_use_argv, void *__never_use_envp,\n\t\t\t\t       int *__never_use_flags);\n#endif\n$1/' fs/exec.c
+            perl -0777 -i -pe 's/(SYSCALL_DEFINE3\(execve,\n\t\tconst char __user \*, filename,\n\t\tconst char __user \*const __user \*, argv,\n\t\tconst char __user \*const __user \*, envp\)\n\{\n)/$1#ifdef CONFIG_KSU\n\tksu_handle_execve_sucompat(&filename, NULL, NULL, NULL);\n#endif\n/' fs/exec.c
+            perl -0777 -i -pe 's/(SYSCALL_DEFINE5\(execveat,\n\t\tint, fd, const char __user \*, filename,\n\t\tconst char __user \*const __user \*, argv,\n\t\tconst char __user \*const __user \*, envp,\n\t\tint, flags\)\n\{\n\tint lookup_flags = \(flags & AT_EMPTY_PATH\) \? LOOKUP_EMPTY : 0;\n)/$1#ifdef CONFIG_KSU\n\tksu_handle_execve_sucompat(&filename, NULL, NULL, NULL);\n#endif\n/' fs/exec.c
+            grep -q "ksu_handle_execve_sucompat(" fs/exec.c && echo "Hook inserted successfully" || echo "WARNING: hook insertion still failed, needs manual review"
+          fi
+
+          # crDroid tree: do_faccessat() lost its "static" qualifier and its "flags" parameter
+          # (older/different signature) - the original script's "^static long do_faccessat"
+          # range anchor never matches, so this hook is silently skipped too.
+          if ! grep -q "ksu_handle_faccessat(" fs/open.c; then
+            echo "faccessat hook missing (crDroid signature drift) - inserting manually..."
+            perl -0777 -i -pe 's/(\tres = user_path_at\(dfd, filename, lookup_flags, &path\);\n)/#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n$1/' fs/open.c
+            grep -q "ksu_handle_faccessat(" fs/open.c && echo "Hook inserted successfully" || echo "WARNING: hook insertion still failed, needs manual review"
+          fi
+
+          # crDroid tree: vfs_statx() no longer calls getname_flags() (already-refactored path
+          # resolution, same pattern as do_execveat_common) - the "getname_flags" anchor never
+          # matches inside vfs_statx, so this hook is silently skipped too.
+          if ! grep -q "ksu_handle_stat(" fs/stat.c; then
+            echo "stat hook missing (crDroid refactor) - inserting manually..."
+            perl -0777 -i -pe 's/(\terror = user_path_at\(dfd, filename, lookup_flags, &path\);\n)/#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n$1/' fs/stat.c
+            grep -q "ksu_handle_stat(" fs/stat.c && echo "Hook inserted successfully" || echo "WARNING: hook insertion still failed, needs manual review"
+          fi
+
+          # NOTE: fs/read_write.c (vfs_read) hook intentionally NOT added - ksu_vfs_read_hook /
+          # ksu_handle_vfs_read do not exist anywhere in ApartTUSITU/SukiSU-Ultra (verified
+          # against the driver source directly); that hook belongs to the original tiann/KernelSU
+          # project's now-deprecated SUS_SU mechanism, not this fork. zee295's script was right
+          # to skip it, just for a different reason than its comment states.
+
+          # Sanity check: confirm all hooks this driver actually implements made it into the
+          # source before we move on, since none of these failures produce a build error - the
+          # kernel compiles and boots fine either way, just without a working manager/root channel.
+          for f in "fs/exec.c:ksu_handle_execveat_ksud(" "fs/exec.c:ksu_handle_execve_sucompat(" "fs/open.c:ksu_handle_faccessat(" "fs/stat.c:ksu_handle_stat(" "kernel/reboot.c:ksu_handle_sys_reboot("; do
+            file="${f%%:*}"; sym="${f##*:}"
+            if grep -q "$sym" "$file"; then
+              echo "OK: $sym present in $file"
+            else
+              echo "MISSING: $sym not found in $file - KernelSU will not be detected as supported!"
+            fi
+          done
+
+      - name: Use Device Config
+        run: |
+          cd kernel
+          mkdir -p out
+          cp $GITHUB_WORKSPACE/device_config out/.config
+          make O=out ARCH=arm64 olddefconfig
+
+      - name: Enable KSU, SUSFS and KPM in Config
+        run: |
+          cd kernel
+          scripts/config --file out/.config -e KSU
+          scripts/config --file out/.config -e KALLSYMS
+          scripts/config --file out/.config -e KALLSYMS_ALL
+          # Required for SUSFS TIF_PROC_UMOUNTED flag
+          scripts/config --file out/.config -e THREAD_INFO_IN_TASK
+          # Enable all SUSFS v2.0.0 features
+          scripts/config --file out/.config -e KSU_SUSFS
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_PATH
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_MOUNT
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_KSTAT
+          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file out/.config -e KSU_SUSFS_ENABLE_LOG
+          scripts/config --file out/.config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          scripts/config --file out/.config -e KSU_SUSFS_OPEN_REDIRECT
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_MAP
+          # Enable KPM support
+          scripts/config --file out/.config -e KPM
+          # Disable BPF preload UMD - not needed on Android, fails to build in CI (missing incbin)
+          scripts/config --file out/.config -d BPF_PRELOAD
+          # Distinctive marker so you can verify via `adb shell uname -r` that this exact custom
+          # build is actually the kernel running (vs. fastboot boot silently falling back to the
+          # flashed stock/crDroid kernel, e.g. due to AVB/vbmeta rejecting the temp boot image)
+          scripts/config --file out/.config --set-str LOCALVERSION "-sukisu-kebab"
+          # Align with crDroid's real kona/oplus config (arch/arm64/configs/vendor/{kona-perf_defconfig,oplus.config}):
+          # legacy drivers/gpu/drm/msm duplicates every symbol in the actual vendor driver techpack/display/msm,
+          # and DRM_OPLUS_NOTIFY is its notifier replacement (also fixes gf_spi.c's notify header include gate)
+          scripts/config --file out/.config -d DRM_MSM
+          scripts/config --file out/.config -e DRM_OPLUS_NOTIFY
+          # Duplicate touchscreen drivers - the oplus_touchscreen Synaptics variant is what's actually used;
+          # the plain synaptics_tcm/ST/DSX drivers duplicate its symbols
+          scripts/config --file out/.config -d TOUCHSCREEN_SYNAPTICS_TCM
+          scripts/config --file out/.config -d TOUCHSCREEN_ST
+          scripts/config --file out/.config -d TOUCHSCREEN_SYNAPTICS_DSX
+          make O=out ARCH=arm64 olddefconfig
+          echo "Checking KSU, SUSFS, and KPM config:"
+          grep -E "CONFIG_KSU|CONFIG_THREAD_INFO|CONFIG_KPM" out/.config | head -40
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          make -j$(nproc --all) O=out ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+
+      - name: Diagnose KernelSU hook symbols (only runs if build failed)
+        if: failure()
+        run: |
+          cd kernel
+          echo "=== Searching for compiled sucompat.o ==="
+          find out -name "sucompat.o" 2>/dev/null
+          echo "=== Symbols defined in sucompat.o (if it exists) ==="
+          find out -name "sucompat.o" -exec llvm-nm {} \; 2>&1 | grep -i "execve\|T ksu_handle" || echo "sucompat.o missing or no matching symbols"
+          echo "=== Symbols referenced (undefined, U) vs defined (T) in exec.o ==="
+          find out -name "exec.o" -path "*/fs/*" -exec llvm-nm {} \; 2>&1 | grep -i "ksu_handle_execve" || echo "exec.o missing or no matching symbols"
+
+      - name: Apply KPM Patch to Kernel Image
+        run: |
+          cd kernel/out/arch/arm64/boot/
+          if [ ! -f "Image" ]; then
+            echo "Build failed - no Image file!"
+            exit 1
+          fi
+          echo "Applying KernelPatch Module (KPM) patch..."
+          wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.2/patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          if [ -f "oImage" ]; then
+            rm Image
+            mv oImage Image
+            echo "KPM patch applied successfully"
+            ls -lh Image
+          else
+            echo "KPM patching failed, using original Image"
+          fi
+          rm -f patch_linux
+
+      - name: Package
+        run: |
+          cd kernel
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "Build failed!"
+            exit 1
+          fi
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+          rm -rf .git modules patch ramdisk
+          cp ../out/arch/arm64/boot/Image .
+          sed -i 's/do.devicecheck=.*/do.devicecheck=1/g' anykernel.sh
+          sed -i 's/device.name1=.*/device.name1=kebab/g' anykernel.sh
+          sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|g' anykernel.sh
+          sed -i 's/is_slot_device=.*/is_slot_device=1;/g' anykernel.sh
+          ZIP_NAME="SukiSU-Ultra-SUSFS_OnePlus8T_$(date +%Y%m%d).zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" * -x .git README.md *placeholder
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Create boot.img
+        run: |
+          cd kernel
+          BOOT_IMG="SukiSU-Ultra-SUSFS_boot_OnePlus8T_$(date +%Y%m%d).img"
+          lz4 -l -12 --favor-decSpeed "$GITHUB_WORKSPACE/lineage-os/ramdisk.cpio" ramdisk.cpio.lz4
+          python3 $GITHUB_WORKSPACE/mkbootimg/mkbootimg.py \
+            --kernel out/arch/arm64/boot/Image \
+            --ramdisk ramdisk.cpio.lz4 \
+            --dtb "$GITHUB_WORKSPACE/lineage-os/dtb" \
+            --pagesize 4096 \
+            --base 0x00000000 \
+            --kernel_offset 0x00008000 \
+            --ramdisk_offset 0x01000000 \
+            --tags_offset 0x00000100 \
+            --dtb_offset 0x01f00000 \
+            --header_version 2 \
+            --os_version 16.0.0 \
+            --os_patch_level 2025-12 \
+            --cmdline "androidboot.hardware=qcom androidboot.memcg=1 androidboot.usbcontroller=a600000.dwc3 cgroup.memory=nokmem,nosocket loop.max_part=7 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 reboot=panic_warm service_locator.enable=1 swiotlb=2048" \
+            --output "$GITHUB_WORKSPACE/$BOOT_IMG"
+          echo "BOOT_IMG=$BOOT_IMG" >> $GITHUB_ENV
+          ls -lh "$GITHUB_WORKSPACE/$BOOT_IMG"
+
+      - name: Upload AnyKernel3 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BOOT_IMG }}
+          path: ${{ env.BOOT_IMG }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: sukisu-susfs-${{ github.run_number }}
+          name: SukiSU-Ultra + SUSFS Build ${{ github.run_number }}
+          body: |
+            ## SukiSU-Ultra + SUSFS v2.0.0 + KPM for OnePlus 8T / kebab (crDroid 16 base)
+
+            This build uses:
+            - [SukiSU-Ultra](https://github.com/ApartTUSITU/SukiSU-Ultra) **ApartTUSITU fork** (non-GKI compatible)
+            - **SUSFS v2.0.0** from k30s-reference kernel implementation
+            - **KPM (KernelPatch Module)** support patched in
+            - Manual syscall hooks (kprobes disabled)
+
+            ### SUSFS v2.0.0 Features
+            - SUS_PATH, SUS_MOUNT, SUS_KSTAT
+            - SPOOF_UNAME, SPOOF_CMDLINE_OR_BOOTCONFIG
+            - OPEN_REDIRECT, SUS_MAP
+            - HIDE_KSU_SUSFS_SYMBOLS
+            - ENABLE_LOG
+
+            ### KPM (KernelPatch Module)
+            Kernel is patched with KPM support for loading additional kernel patches
+
+            ### Installation
+            - Flash via TWRP or fastboot boot.img
+
+            ### Manager
+            Use SukiSU Manager from: https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.BOOT_IMG }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
